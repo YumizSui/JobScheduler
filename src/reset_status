@@ -1,0 +1,22 @@
+# reset_status
+import argparse
+import csv
+def main():
+    parser = argparse.ArgumentParser(description="Reset the status of all the entries in the CSV file.")
+    parser.add_argument("csv_file", help="The CSV file to reset.")
+    parser.add_argument("--status_col", default="status", help="Name of the status column.")
+    args = parser.parse_args()
+
+    with open(args.csv_file, "r") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        for row in rows:
+            row[args.status_col] = "pending"
+
+    with open(args.csv_file, "w") as f:
+        writer = csv.DictWriter(f, fieldnames=reader.fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+if __name__ == "__main__":
+    main()

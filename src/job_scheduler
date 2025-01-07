@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Parallel-friendly CSV-based scheduler that passes CSV columns as command-line arguments.
+Jobs have 'status' and 'job_id' columns. If not present, they are added automatically.
+"""
+
+import argparse
+import csv
+import fcntl
+import logging
+import os
+import subprocess
+import time
+import uuid
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+
+def ensure_columns(csv_file: str) -> None:
+    """
+    Ensures that the CSV file has both 'status' and 'job_id' columns.
+    If they are missing, they are added (status='pending', job_id='job_<random>').
+    """
+    with open(csv_file, "r+", encoding="utf-8", newline="") as source:
+        fd = source.fileno()
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        reader = csv.DictReader(source)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+        added_status = False
+        added_job_id = False
+
+        if "status" not in fieldnames:
+            fieldnames.append("status")
+            added_status = True
+
+        if "job_id" not in fieldnames:
+            fieldnames.append("job_id")
+            added_job_id = True
+
+        if not (added_status or added_job_id):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return
+
+        # Update rows
+        for row in rows:
+            if added_status:
+                row["status"] = "pending"
+            if added_job_id:
+                row["job_id"] = f"job_{uuid.uuid4().hex[:8]}"
+
+        # Rewrite the CSV
+        source.seek(0)
+        source.truncate(0)
+        writer = csv.DictWriter(source, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def recover_stuck_jobs(csv_file: str, job_lock_dir: str) -> None:
+    """
+    Checks for jobs with status='running' whose lock file is not actually locked,
+    and reverts them to 'pending'.
+    """
+    with open(csv_file, "r+", encoding="utf-8", newline="") as source:
+        fd = source.fileno()
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        reader = csv.DictReader(source)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+        updated = False
+        for row in rows:
+            if row.get("status") == "running":
+                j_id = row.get("job_id", "")
+                if not j_id:
+                    continue
+
+                lock_path = os.path.join(job_lock_dir, f"{j_id}.lock")
+                if not os.path.exists(lock_path):
+                    # Lock file doesn't exist => stuck job
+                    row["status"] = "pending"
+                    updated = True
+                else:
+                    # Try to lock non-blocking; if we succeed, no one is locking it
+                    try:
+                        with open(lock_path, "r+") as lf:
+                            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            row["status"] = "pending"
+                            updated = True
+                            fcntl.flock(lf, fcntl.LOCK_UN)
+                            os.remove(lock_path)
+                    except BlockingIOError:
+                        # It's locked by a process => job is truly running
+                        pass
+
+        if updated:
+            source.seek(0)
+            source.truncate(0)
+            writer = csv.DictWriter(source, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def get_pending_job(csv_file: str) -> dict:
+    """
+    Finds the first row with 'status'='pending'. Marks it 'running' and returns it.
+    Returns an empty dict if none are pending.
+    """
+    with open(csv_file, "r+", encoding="utf-8", newline="") as source:
+        fd = source.fileno()
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        reader = csv.DictReader(source)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+        selected_row = {}
+        found_idx = None
+        for idx, row in enumerate(rows):
+            if row.get("status") == "pending":
+                found_idx = idx
+                break
+
+        if found_idx is not None:
+            rows[found_idx]["status"] = "running"
+            selected_row = dict(rows[found_idx])
+
+            source.seek(0)
+            source.truncate(0)
+            writer = csv.DictWriter(source, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return selected_row
+
+
+def mark_done(csv_file: str, job_row: dict) -> None:
+    """
+    Sets 'status'='done' for the job with the matching 'job_id'.
+    """
+    job_id = job_row.get("job_id", "")
+    if not job_id:
+        return
+
+    with open(csv_file, "r+", encoding="utf-8", newline="") as source:
+        fd = source.fileno()
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        reader = csv.DictReader(source)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+        for row in rows:
+            if row.get("job_id") == job_id:
+                row["status"] = "done"
+
+        source.seek(0)
+        source.truncate(0)
+        writer = csv.DictWriter(source, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def run_job(row: dict, job_lock_dir: str, script_path: str) -> int:
+    """
+    Executes a job by:
+      1. Creating a lock file for this job.
+      2. Locking it exclusively.
+      3. Passing the CSV columns (except 'status', 'job_id') as command-line arguments.
+      4. Running the external script with real-time output handling.
+      5. Unlocking the file.
+
+    Returns the script's return code.
+    """
+    job_id = row.get("job_id", "")
+    lock_path = os.path.join(job_lock_dir, f"{job_id}.lock")
+    os.makedirs(job_lock_dir, exist_ok=True)
+
+    fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        # Prepare the argument list.
+        # Example: [script_path, --paramA, foo, --paramB, 1]
+        args_list = ["bash", script_path]
+        for k, v in row.items():
+            if k in ("status", "job_id"):
+                continue
+            if v is not None:
+                args_list.append(str(v))
+
+        logging.info(f"Job {job_id} starting with command: {' '.join(args_list)}")
+
+        # Create subprocess with pipes for stdout and stderr
+        process = subprocess.Popen(
+            args_list,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+
+        # Function to handle output streams synchronously
+        def print_output(pipe, prefix):
+            for line in pipe:
+                logging.info(f"Job {job_id} {prefix}: {line.rstrip()}")
+
+        # Create and start threads for handling stdout and stderr
+        from threading import Thread
+        stdout_thread = Thread(target=print_output, args=(process.stdout, "stdout"))
+        stderr_thread = Thread(target=print_output, args=(process.stderr, "stderr"))
+
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for the process to complete
+        return_code = process.wait()
+
+        # Wait for output handling to complete
+        stdout_thread.join()
+        stderr_thread.join()
+
+        logging.info(f"Job {job_id} completed with return code {return_code}")
+        return return_code
+
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        os.remove(lock_path)
+
+def reset_jobs(csv_file: str, lock_file: str, job_lock_dir: str) -> None:
+    """
+    Resets all jobs to 'pending' status and regenerates job IDs.
+    If any job lock file is locked, no reset is performed.
+    """
+    raise NotImplementedError("Resetting jobs is not yet implemented.")
+
+def run_scheduling(csv_file: str, lock_file: str, job_lock_dir: str,
+                   max_runtime: int, script_path: str, reset: bool = False) -> None:
+    """
+    Main scheduling loop:
+      - Adds 'status' and 'job_id' columns if missing.
+      - In a loop:
+          * Check for stuck "running" jobs and revert them to "pending" if needed.
+          * Acquire a new "pending" job (if any) and set it "running".
+          * Run the job by passing arguments to the script.
+          * Mark the job as "done".
+          * Stop if no pending jobs remain or if total runtime has been exceeded.
+    """
+    logging.info("Initializing scheduler...")
+
+    if reset:
+        logging.info("Resetting all jobs to 'pending' status and regenerating job IDs.")
+        reset_jobs(csv_file, lock_file, job_lock_dir)
+    # Briefly lock to ensure columns
+    fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        ensure_columns(csv_file)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+    start_time = time.time()
+
+    while True:
+        elapsed = time.time() - start_time
+        logging.info(f"Elapsed time: {elapsed:.2f}/{max_runtime} seconds")
+        if elapsed >= max_runtime:
+            logging.info("Reached maximum total runtime. Stopping.")
+            break
+
+        # Recover stuck jobs
+        logging.info("Recovering stuck jobs...")
+        fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            recover_stuck_jobs(csv_file, job_lock_dir)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+        # Get a pending job
+        logging.info("Checking for pending jobs...")
+        fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            row = get_pending_job(csv_file)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+        if not row:
+            logging.info("No pending jobs. Scheduling is complete.")
+            break
+
+        # Run the job
+        logging.info("Running job {}...".format(row.get("job_id", "").strip()))
+        ret_code = run_job(row, job_lock_dir, script_path)
+        # Mark done (whether success or fail)
+        fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            mark_done(csv_file, row)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Parallel-friendly CSV scheduler that passes row parameters as script arguments."
+    )
+    parser.add_argument("csv_file", help="Path to the CSV file.")
+    parser.add_argument("script_path", help="Path to the external script to run each job.")
+    parser.add_argument("--lock_file", help="Path to the master lock file.", default="master_scheduler.lock")
+    parser.add_argument("--job_lock_dir", help="Directory for job-specific lock files.", default="job_locks")
+    parser.add_argument("--max_runtime", type=int, default=86400,
+                        help="Maximum total runtime in seconds.")
+    parser.add_argument("--reset", action="store_true",
+                        help="Reset all jobs to 'pending' status and regenerate job IDs.")
+    args = parser.parse_args()
+
+    run_scheduling(
+        csv_file=args.csv_file,
+        lock_file=args.lock_file,
+        job_lock_dir=args.job_lock_dir,
+        max_runtime=args.max_runtime,
+        script_path=args.script_path,
+        reset=args.reset
+    )
+
+
+if __name__ == "__main__":
+    main()
