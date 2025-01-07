@@ -1,4 +1,4 @@
-# Parallel-Friendly CSV Scheduler
+# JobScheduler: Parallel-Friendly CSV Scheduler
 
 A minimal CSV-based job scheduler designed to run jobs in parallel. Each row in a CSV file represents a job, with its parameters passed directly to an external script. The script automatically adds `status` and `job_id` columns if they’re missing, and uses file locks to prevent race conditions.
 
