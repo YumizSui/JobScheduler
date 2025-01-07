@@ -46,16 +46,24 @@ def ensure_columns(csv_file: str) -> None:
             fieldnames.append("job_id")
             added_job_id = True
 
-        if not (added_status or added_job_id):
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            return
-
-        # Update rows
+        updated = False
         for row in rows:
             if added_status:
                 row["status"] = "pending"
+                updated = True
+            elif not row.get("status"):
+                row["status"] = "pending"
+                updated = True
             if added_job_id:
                 row["job_id"] = f"job_{uuid.uuid4().hex[:8]}"
+                updated = True
+            elif not row.get("job_id"):
+                row["job_id"] = f"job_{uuid.uuid4().hex[:8]}"
+                updated = True
+
+        if not updated:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return
 
         # Rewrite the CSV
         source.seek(0)
