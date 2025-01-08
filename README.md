@@ -37,5 +37,5 @@ Locking relies on POSIX `fcntl`, so this will only work on Unix-like systems. Al
 When using a supercomputer, you can use job scheduler like `qsub` and array jobs to run this script in parallel.
 
 ```bash
-qsub -t 1-4 test_job.sh
+qsub -t 1-4 run.sh
 ```
