@@ -160,9 +160,10 @@ def get_pending_job(csv_file: str) -> dict:
         return selected_row
 
 
-def mark_done(csv_file: str, job_row: dict) -> None:
+def mark_done(csv_file: str, job_row: dict, status: str = "done") -> None:
     """
     Sets 'status'='done' for the job with the matching 'job_id'.
+    If status is 'error', sets it to 'error' instead.
     """
     job_id = job_row.get("job_id", "")
     if not job_id:
@@ -178,7 +179,7 @@ def mark_done(csv_file: str, job_row: dict) -> None:
 
         for row in rows:
             if row.get("job_id") == job_id:
-                row["status"] = "done"
+                row["status"] = status
 
         source.seek(0)
         source.truncate(0)
@@ -258,7 +259,8 @@ def run_job(row: dict, job_lock_dir: str, script_path: str) -> int:
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-        os.remove(lock_path)
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
 
 def reset_jobs(csv_file: str, lock_file: str, job_lock_dir: str) -> None:
     """
@@ -333,7 +335,10 @@ def run_scheduling(csv_file: str, lock_file: str, job_lock_dir: str,
         fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            mark_done(csv_file, row)
+            if ret_code == 0:
+                mark_done(csv_file, row)
+            else:
+                mark_done(csv_file, row, status="error")
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
