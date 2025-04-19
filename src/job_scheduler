@@ -3,7 +3,7 @@
 
 """
 Parallel-friendly CSV-based scheduler that passes CSV columns as command-line arguments.
-Jobs have 'status' and 'job_id' columns. If not present, they are added automatically.
+Jobs have 'status', 'job_id', and 'elapsed_time' columns. If not present, they are added automatically.
 """
 
 import argparse
@@ -24,8 +24,8 @@ logging.basicConfig(
 
 def ensure_columns(csv_file: str) -> None:
     """
-    Ensures that the CSV file has both 'status' and 'job_id' columns.
-    If they are missing, they are added (status='pending', job_id='job_<random>').
+    Ensures that the CSV file has 'status', 'job_id', and 'elapsed_time' columns.
+    If they are missing, they are added (status='pending', job_id='job_<random>', elapsed_time='').
     """
     with open(csv_file, "r+", encoding="utf-8", newline="") as source:
         fd = source.fileno()
@@ -37,6 +37,7 @@ def ensure_columns(csv_file: str) -> None:
 
         added_status = False
         added_job_id = False
+        added_elapsed_time = False
 
         if "status" not in fieldnames:
             fieldnames.append("status")
@@ -45,6 +46,10 @@ def ensure_columns(csv_file: str) -> None:
         if "job_id" not in fieldnames:
             fieldnames.append("job_id")
             added_job_id = True
+
+        if "elapsed_time" not in fieldnames:
+            fieldnames.append("elapsed_time")
+            added_elapsed_time = True
 
         updated = False
         for row in rows:
@@ -57,8 +62,14 @@ def ensure_columns(csv_file: str) -> None:
             if added_job_id:
                 row["job_id"] = f"job_{uuid.uuid4().hex[:8]}"
                 updated = True
-            elif not row.get("job_id"):
+            elif not row.get("job_id") or len(row.get("job_id", "").strip()) == 0:
                 row["job_id"] = f"job_{uuid.uuid4().hex[:8]}"
+                updated = True
+            if added_elapsed_time:
+                row["elapsed_time"] = ""
+                updated = True
+            elif not row.get("elapsed_time"):
+                row["elapsed_time"] = ""
                 updated = True
 
         if not updated:
@@ -125,7 +136,7 @@ def recover_stuck_jobs(csv_file: str, job_lock_dir: str) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-def get_pending_job(csv_file: str) -> dict:
+def get_pending_job(csv_file: str, available_time: int, speed_factor: int) -> dict:
     """
     Finds the first row with 'status'='pending'. Marks it 'running' and returns it.
     Returns an empty dict if none are pending.
@@ -142,13 +153,22 @@ def get_pending_job(csv_file: str) -> dict:
         found_idx = None
         for idx, row in enumerate(rows):
             if row.get("status") == "pending":
-                found_idx = idx
-                break
+                est_val = row.get("estimate_time", "0").strip()
+                if not est_val:
+                    continue
+                try:
+                    est_hours = float(est_val)
+                except ValueError:
+                    continue
+                est_seconds = est_hours * 3600 / speed_factor
+                if est_seconds <= available_time:
+                    found_idx = idx
+                    selected_row = dict(row)
+                    rows[idx]["status"] = "running"
+                    break
 
         if found_idx is not None:
-            rows[found_idx]["status"] = "running"
-            selected_row = dict(rows[found_idx])
-
+            # Rewrite the CSV with the updated status.
             source.seek(0)
             source.truncate(0)
             writer = csv.DictWriter(source, fieldnames=fieldnames)
@@ -160,10 +180,11 @@ def get_pending_job(csv_file: str) -> dict:
         return selected_row
 
 
-def mark_done(csv_file: str, job_row: dict, status: str = "done") -> None:
+def mark_done(csv_file: str, job_row: dict, status: str = "done", elapsed_time: float = None) -> None:
     """
     Sets 'status'='done' for the job with the matching 'job_id'.
     If status is 'error', sets it to 'error' instead.
+    Also updates the 'elapsed_time' if provided.
     """
     job_id = job_row.get("job_id", "")
     if not job_id:
@@ -180,6 +201,8 @@ def mark_done(csv_file: str, job_row: dict, status: str = "done") -> None:
         for row in rows:
             if row.get("job_id") == job_id:
                 row["status"] = status
+                if elapsed_time is not None:
+                    row["elapsed_time"] = f"{elapsed_time:.2f}"
 
         source.seek(0)
         source.truncate(0)
@@ -191,16 +214,16 @@ def mark_done(csv_file: str, job_row: dict, status: str = "done") -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-def run_job(row: dict, job_lock_dir: str, script_path: str) -> int:
+def run_job(row: dict, job_lock_dir: str, script_path: str) -> tuple:
     """
     Executes a job by:
       1. Creating a lock file for this job.
       2. Locking it exclusively.
-      3. Passing the CSV columns (except 'status', 'job_id') as command-line arguments.
+      3. Passing the CSV columns (except 'status', 'job_id', 'estimate_time', 'elapsed_time') as command-line arguments.
       4. Running the external script with real-time output handling.
       5. Unlocking the file.
 
-    Returns the script's return code.
+    Returns the script's return code and elapsed execution time.
     """
     job_id = row.get("job_id", "")
     lock_path = os.path.join(job_lock_dir, f"{job_id}.lock")
@@ -214,12 +237,15 @@ def run_job(row: dict, job_lock_dir: str, script_path: str) -> int:
         # Example: [script_path, --paramA, foo, --paramB, 1]
         args_list = ["bash", script_path]
         for k, v in row.items():
-            if k in ("status", "job_id"):
+            if k in ("status", "job_id", "estimate_time", "elapsed_time"):
                 continue
             if v is not None:
                 args_list.append(str(v))
 
         logging.info(f"Job {job_id} starting with command: {' '.join(args_list)}")
+
+        # Start timing the job execution
+        start_time = time.time()
 
         # Create subprocess with pipes for stdout and stderr
         process = subprocess.Popen(
@@ -249,18 +275,22 @@ def run_job(row: dict, job_lock_dir: str, script_path: str) -> int:
         # Wait for the process to complete
         return_code = process.wait()
 
+        # Calculate elapsed time
+        elapsed_time = time.time() - start_time
+
         # Wait for output handling to complete
         stdout_thread.join()
         stderr_thread.join()
 
-        logging.info(f"Job {job_id} completed with return code {return_code}")
-        return return_code
+        logging.info(f"Job {job_id} completed with return code {return_code} in {elapsed_time:.2f} seconds")
+        return return_code, elapsed_time
 
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
         if os.path.exists(lock_path):
             os.remove(lock_path)
+
 
 def reset_jobs(csv_file: str, lock_file: str, job_lock_dir: str) -> None:
     """
@@ -269,11 +299,12 @@ def reset_jobs(csv_file: str, lock_file: str, job_lock_dir: str) -> None:
     """
     raise NotImplementedError("Resetting jobs is not yet implemented.")
 
+
 def run_scheduling(csv_file: str, lock_file: str, job_lock_dir: str,
-                   max_runtime: int, script_path: str, reset: bool = False) -> None:
+                   max_runtime: int, margin_time: int, speed_factor: int, script_path: str, reset: bool = False) -> None:
     """
     Main scheduling loop:
-      - Adds 'status' and 'job_id' columns if missing.
+      - Adds 'status', 'job_id', and 'elapsed_time' columns if missing.
       - In a loop:
           * Check for stuck "running" jobs and revert them to "pending" if needed.
           * Acquire a new "pending" job (if any) and set it "running".
@@ -297,11 +328,18 @@ def run_scheduling(csv_file: str, lock_file: str, job_lock_dir: str,
 
     start_time = time.time()
 
+
     while True:
         elapsed = time.time() - start_time
         logging.info(f"Elapsed time: {elapsed:.2f}/{max_runtime} seconds")
         if elapsed >= max_runtime:
             logging.info("Reached maximum total runtime. Stopping.")
+            break
+
+        available_time = max_runtime - elapsed - margin_time
+
+        if available_time <= 0:
+            logging.info("Not enough available time remaining (considering margin). Terminating scheduling.")
             break
 
         # Recover stuck jobs
@@ -319,7 +357,7 @@ def run_scheduling(csv_file: str, lock_file: str, job_lock_dir: str,
         fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            row = get_pending_job(csv_file)
+            row = get_pending_job(csv_file, available_time, speed_factor)
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -328,17 +366,15 @@ def run_scheduling(csv_file: str, lock_file: str, job_lock_dir: str,
             logging.info("No pending jobs. Scheduling is complete.")
             break
 
-        # Run the job
         logging.info("Running job {}...".format(row.get("job_id", "").strip()))
-        ret_code = run_job(row, job_lock_dir, script_path)
-        # Mark done (whether success or fail)
+        ret_code, job_elapsed_time = run_job(row, job_lock_dir, script_path)
         fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             if ret_code == 0:
-                mark_done(csv_file, row)
+                mark_done(csv_file, row, elapsed_time=job_elapsed_time)
             else:
-                mark_done(csv_file, row, status="error")
+                mark_done(csv_file, row, status="error", elapsed_time=job_elapsed_time)
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -354,6 +390,10 @@ def main():
     parser.add_argument("--job_lock_dir", help="Directory for job-specific lock files.", default="job_locks")
     parser.add_argument("--max_runtime", type=int, default=86400,
                         help="Maximum total runtime in seconds.")
+    parser.add_argument("--margin_time", type=int, default=0,
+                        help="Margin time in seconds.")
+    parser.add_argument("--speed_factor", type=float, default=1,
+                        help="Factor representing relative computation speed (higher is faster).")
     parser.add_argument("--reset", action="store_true",
                         help="Reset all jobs to 'pending' status and regenerate job IDs.")
     args = parser.parse_args()
@@ -362,8 +402,10 @@ def main():
         csv_file=args.csv_file,
         lock_file=args.lock_file,
         job_lock_dir=args.job_lock_dir,
-        max_runtime=args.max_runtime,
+        max_runtime=args.max_runtime - 300,
+        margin_time=args.margin_time,
         script_path=args.script_path,
+        speed_factor=args.speed_factor,
         reset=args.reset
     )
 
